@@ -1,0 +1,7 @@
+{
+  "name": "my-ipc-app",
+  "version-string": "1.0.0",
+  "dependencies": [
+    "oatpp"
+  ]
+}
