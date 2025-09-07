@@ -14,10 +14,14 @@
 #include <unistd.h>
 #include <semaphore.h>
 
-// Socket includes for HTTP server
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
+// Oat++ includes
+#include "oatpp/web/server/HttpConnectionHandler.hpp"
+#include "oatpp/web/server/HttpRouter.hpp"
+#include "oatpp/network/Server.hpp"
+#include "oatpp/network/tcp/server/ConnectionProvider.hpp"
+#include "oatpp/parser/json/mapping/ObjectMapper.hpp"
+#include "oatpp/core/macro/codegen.hpp"
+#include "oatpp/core/macro/component.hpp"
 
 // Global shared memory
 int g_shm = -1;
@@ -128,7 +132,6 @@ bool initializeIPC() {
     return true;
 }
 
-// Clean up IPC resources
 void cleanupIPC() {
     if (g_shm_fd) {
         munmap(g_shm_fd, sizeof(SharedMem));
@@ -283,69 +286,27 @@ void monitorThread() {
     std::cout << "Monitor thread shutting down..." << std::endl;
 }
 
-// Simple HTTP response helper
-std::string createHttpResponse(int status, const std::string& content, const std::string& contentType = "text/plain") {
-    std::ostringstream response;
-    response << "HTTP/1.1 " << status;
-    
-    if (status == 200) response << " OK";
-    else if (status == 404) response << " Not Found";
-    else if (status == 500) response << " Internal Server Error";
-    
-    response << "\r\n";
-    response << "Content-Type: " << contentType << "\r\n";
-    response << "Content-Length: " << content.length() << "\r\n";
-    response << "Access-Control-Allow-Origin: *\r\n";
-    response << "Connection: close\r\n";
-    response << "\r\n";
-    response << content;
-    
-    return response.str();
-}
+#include OATPP_CODEGEN_BEGIN(ApiController)
 
-struct HttpRequest {
-    std::string method;
-    std::string path;
-    std::string body;
-    
-    static HttpRequest parse(const std::string& request) {
-        HttpRequest req;
-        std::istringstream stream(request);
-        std::string line;
-        
-        // Parse first line: METHOD PATH HTTP/1.1
-        if (std::getline(stream, line)) {
-            std::istringstream firstLine(line);
-            firstLine >> req.method >> req.path;
-        }
-        
-        // Skip headers until empty line
-        int contentLength = 0;
-        while (std::getline(stream, line) && line != "\r") {
-            if (line.find("Content-Length:") == 0) {
-                contentLength = std::stoi(line.substr(16));
-            }
-        }
-        
-        // Read body if present
-        if (contentLength > 0) {
-            req.body.resize(contentLength);
-            stream.read(&req.body[0], contentLength);
-        }
-        
-        return req;
-    }
-};
+class ApiController : public oatpp::web::server::api::ApiController {
+public:
+    ApiController(OATPP_COMPONENT(std::shared_ptr<ObjectMapper>, objectMapper))
+        : oatpp::web::server::api::ApiController(objectMapper) {}
 
-// HTTP request handler
-std::string handleHttpRequest(const HttpRequest& request) {
-    if (request.method == "GET" && request.path == "/health") {
-        return createHttpResponse(200, "Server is running");
+    static std::shared_ptr<ApiController> createShared(
+        OATPP_COMPONENT(std::shared_ptr<ObjectMapper>, objectMapper)) {
+        return std::make_shared<ApiController>(objectMapper);
     }
-    
-    if (request.method == "GET" && request.path == "/status") {
+
+    ENDPOINT("GET", "/health", health) {
+        auto response = createResponse(Status::CODE_200, "Server is running");
+        response->putHeader(Header::CONTENT_TYPE, "text/plain");
+        return response;
+    }
+
+    ENDPOINT("GET", "/status", status) {
         if (!g_shm_fd) {
-            return createHttpResponse(500, "Shared memory not initialized");
+            return createResponse(Status::CODE_500, "Shared memory not initialized");
         }
         
         size_t head = g_shm_fd->head.load();
@@ -368,20 +329,25 @@ std::string handleHttpRequest(const HttpRequest& request) {
         json << "  \"architecture\": \"lock-free-ring-buffer\"\n";
         json << "}";
         
-        return createHttpResponse(200, json.str(), "application/json");
+        auto response = createResponse(Status::CODE_200, json.str().c_str());
+        response->putHeader(Header::CONTENT_TYPE, "application/json");
+        return response;
     }
-    
-    if (request.method == "POST" && request.path == "/process") {
-        if (request.body.empty()) {
-            return createHttpResponse(400, "Request body is required");
+
+    ENDPOINT("POST", "/process", process, 
+             BODY_STRING(String, body)) {
+        if (!body || body->empty()) {
+            return createResponse(Status::CODE_400, "Request body is required");
         }
-        std::cout << "[SERVER] Received request: " << request.body << std::endl;
-        std::string response = processRequest(request.body);
+        
+        std::cout << "[SERVER] Received request: " << body->c_str() << std::endl;
+        std::string response = processRequest(body->c_str());
         std::cout << "[SERVER] Response from worker: " << response << std::endl;
-        return createHttpResponse(200, response);
+        
+        return createResponse(Status::CODE_200, response.c_str());
     }
-    
-    if (request.method == "POST" && request.path == "/shutdown") {
+
+    ENDPOINT("POST", "/shutdown", shutdown) {
         std::cout << "Shutdown requested via HTTP API" << std::endl;
         
         // Trigger graceful shutdown
@@ -390,69 +356,71 @@ std::string handleHttpRequest(const HttpRequest& request) {
             g_shm_fd->shutdown_requested.store(true, std::memory_order_release);
         }
         
-        return createHttpResponse(200, "Server shutdown initiated...");
+        return createResponse(Status::CODE_200, "Server shutdown initiated...");
     }
-    
-    return createHttpResponse(404, "Not Found");
-}
+};
 
-// HTTP server thread
-void httpServerThread() {
-    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd == -1) {
-        perror("socket failed");
-        return;
-    }
+#include OATPP_CODEGEN_END(ApiController)
+
+class AppComponent {
+public:
     
-    int opt = 1;
-    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    /**
+     * Create ConnectionProvider component which listens on the port
+     */
+    OATPP_CREATE_COMPONENT(std::shared_ptr<oatpp::network::ServerConnectionProvider>, serverConnectionProvider)([] {
+        return oatpp::network::tcp::server::ConnectionProvider::createShared(
+            {"0.0.0.0", 8000, oatpp::network::Address::IP_4});
+    }());
     
-    struct sockaddr_in address;
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = INADDR_ANY;
-    address.sin_port = htons(8000);
+    OATPP_CREATE_COMPONENT(std::shared_ptr<oatpp::web::server::HttpRouter>, httpRouter)([] {
+        return oatpp::web::server::HttpRouter::createShared();
+    }());
     
-    if (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0) {
-        perror("bind failed");
-        close(server_fd);
-        return;
-    }
+    /**
+     * Create ConnectionHandler component which uses Router component to route requests
+     */
+    OATPP_CREATE_COMPONENT(std::shared_ptr<oatpp::network::ConnectionHandler>, serverConnectionHandler)([] {
+        OATPP_COMPONENT(std::shared_ptr<oatpp::web::server::HttpRouter>, router);
+        return oatpp::web::server::HttpConnectionHandler::createShared(router);
+    }());
     
-    if (listen(server_fd, 10) < 0) {
-        perror("listen failed");
-        close(server_fd);
-        return;
-    }
+    /**
+     * Create ObjectMapper component to serialize/deserialize DTOs in Controller's API
+     */
+    OATPP_CREATE_COMPONENT(std::shared_ptr<oatpp::data::mapping::ObjectMapper>, apiObjectMapper)([] {
+        return oatpp::parser::json::mapping::ObjectMapper::createShared();
+    }());
+
+};
+
+void oatppServerThread() {
+    oatpp::base::Environment::init();
     
-    std::cout << "HTTP server listening on port 8000" << std::endl;
+    AppComponent components;
     
-    while (!g_shutdown_requested.load()) {
-        int client_socket = accept(server_fd, nullptr, nullptr);
-        if (client_socket < 0 || g_shutdown_requested.load()) {
-            break;
-        }
-        
-        // Handle request in a separate thread
-        std::thread([client_socket]() {
-            char buffer[4096] = {0};
-            ssize_t bytes_read = read(client_socket, buffer, sizeof(buffer) - 1);
-            
-            if (bytes_read > 0) {
-                HttpRequest request = HttpRequest::parse(std::string(buffer, bytes_read));
-                std::string response = handleHttpRequest(request);
-                write(client_socket, response.c_str(), response.length());
-            }
-            
-            close(client_socket);
-        }).detach();
-    }
+    OATPP_COMPONENT(std::shared_ptr<oatpp::web::server::HttpRouter>, router);
     
-    std::cout << "HTTP server shutting down..." << std::endl;
-    close(server_fd);
+    /* Create ApiController and add all of its endpoints to router */
+    auto controller = ApiController::createShared();
+    router->addController(controller);
+    
+    OATPP_COMPONENT(std::shared_ptr<oatpp::network::ConnectionHandler>, connectionHandler);
+    OATPP_COMPONENT(std::shared_ptr<oatpp::network::ServerConnectionProvider>, connectionProvider);
+    
+    oatpp::network::Server server(connectionProvider, connectionHandler);
+    
+    std::cout << "Oat++ HTTP server listening on port 8000" << std::endl;
+    
+    server.run();
+    
+    std::cout << "Oat++ HTTP server shutting down..." << std::endl;
+    
+    oatpp::base::Environment::destroy();
 }
 
 int main(int argc, const char* argv[]) {
-    std::cout << "HTTP Server starting..." << std::endl;
+    std::cout << "Oat++ HTTP Server starting..." << std::endl;
     
     // Set up signal handlers for graceful shutdown
     signal(SIGINT, signalHandler);   // Ctrl+C
@@ -469,18 +437,17 @@ int main(int argc, const char* argv[]) {
     std::thread monitor(monitorThread);
     monitor.detach();
 
-    // Start HTTP server thread
-    std::thread httpServer(httpServerThread);
-    httpServer.detach();
+    std::thread oatppServer(oatppServerThread);
+    oatppServer.detach();
 
     std::cout << " Server initialized successfully!" << std::endl;
     std::cout << " - Ring capacity: " << RING_CAP << " slots" << std::endl;
     std::cout << " - Max workers: " << MAX_WORKERS << std::endl;
     std::cout << " - Chunk size: " << CHUNK_SIZE << " bytes" << std::endl;
+    std::cout << " - Using Oat++ HTTP framework" << std::endl;
     std::cout << " Start worker processes to handle requests" << std::endl;
     std::cout << " Server running... Press Ctrl+C to stop" << std::endl;
     
-    // Keep server running until shutdown is requested
     while (!g_shutdown_requested.load()) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
